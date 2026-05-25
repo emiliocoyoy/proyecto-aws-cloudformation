@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infraestructura de Alta Disponibilidad con ALB, ASG (10 EC2) y NGINX - Amazon Linux 2023'
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Selecciona la VPC donde se desplegará la infraestructura.
+  
+  Subnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Selecciona al menos dos Subredes Públicas (en diferentes Zonas de Disponibilidad) para el Load Balancer y las EC2.
+
+Resources:
+  # ---- 1. GRUPO DE SEGURIDAD PARA EL BALANCEADOR (ALB) ----
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permitir trafico HTTP entrante al Load Balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  # ---- 2. GRUPO DE SEGURIDAD PARA LAS INSTANCIAS EC2 ----
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permitir trafico solo desde el Load Balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+  # ---- 3. APPLICATION LOAD BALANCER (ALB) ----
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: my-nginx-alb
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets: !Ref Subnets
+      Type: application
+
+  # ---- 4. TARGET GROUP (Grupo Destino para el ALB) ----
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: instance
+
+  # ---- 5. LISTENER (Escuchador del ALB en el puerto 80) ----
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # ---- 6. LAUNCH TEMPLATE (Plantilla de Lanzamiento de las EC2) ----
+  EC2LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: nginx-ec2-launch-template
+      LaunchTemplateData:
+        # SSM Parameter para obtener la ultima AMI de Amazon Linux 2023 automáticamente
+        ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+        InstanceType: t3.micro
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # Actualizar el sistema e instalar NGINX
+            dnf update -y
+            dnf install -y nginx
+            
+            # Iniciar y habilitar el servicio de NGINX
+            systemctl start nginx
+            systemctl enable nginx
+            
+            # Crear la estructura de la pagina web solicitada
+            cat <<EOF > /usr/share/nginx/html/index.html
+            <!DOCTYPE html>
+            <html lang="es">
+            <head>
+                <meta charset="UTF-8">
+                <title>Proyecto CloudFormation</title>
+                <style>
+                    body { font-family: Arial, sans-serif; text-align: center; margin-top: 100px; background-color: #f4f6f9; color: #333; }
+                    h1 { color: #232f3e; font-size: 3em; }
+                    p { font-size: 1.5em; color: #5a6b7c; }
+                </style>
+            </head>
+            <body>
+                <h1>Mi Proyecto CloudFormation</h1>
+                <p>Creado por Emilio Coyoy</p>
+            </body>
+            </html>
+            EOF
+
+  # ---- 7. AUTO SCALING GROUP (Manejo de las 10 instancias EC2) ----
+  EC2AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: nginx-high-availability-asg
+      VPCZoneIdentifier: !Ref Subnets
+      LaunchTemplate:
+        LaunchTemplateId: !Ref EC2LaunchTemplate
+        Version: !GetAtt EC2LaunchTemplate.LatestVersionNumber
+      MinSize: '1'      # Permite que la app funcione aunque caigan 9 servidores
+      MaxSize: '12'
+      DesiredCapacity: '10' # Mantiene activas las 10 EC2 solicitadas
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+
+Outputs:
+  LoadBalancerDNS:
+    Description: URL publica del Balanceador de Carga para acceder al sitio web
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
